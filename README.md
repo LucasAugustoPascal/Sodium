@@ -50,7 +50,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/tonpseudo/sodium-launcher
+git clone https://github.com/LucasAugustoPascal/Sodium.git
 
 # Run the launcher
 # (add your specific instructions here)
