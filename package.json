@@ -6,8 +6,12 @@
   "scripts": {
     "build": "tsc"
   },
-  "dependencies": {},
   "devDependencies": {
+    "autoprefixer": "^10.4.27",
+    "flowbite": "^4.0.1",
+    "flowbite-svelte": "^1.33.0",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2",
     "typescript": "^5.5.3"
   },
   "private": true

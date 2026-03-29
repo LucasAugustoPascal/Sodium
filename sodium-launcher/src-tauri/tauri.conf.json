@@ -15,7 +15,9 @@
         "title": "Sodium V1.0",
         "width": 900,
         "height": 600,
-        "resizable": false
+        "resizable": false,
+        "devtools": true,
+        "transparent": false
       }
     ],
     "security": {
@@ -32,5 +34,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
   }
 }

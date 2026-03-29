@@ -5,6 +5,23 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "shell:allow-open",
+    "http:default",
+    "store:allow-load",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-delete",
+
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [
+        { "url": "https://login.microsoftonline.com/**" },
+        { "url": "https://user.auth.xboxlive.com/**" },
+        { "url": "https://xsts.auth.xboxlive.com/**" },
+        { "url": "https://api.minecraftservices.com/**" },
+        { "url": "https://crafatar.com/**" },
+        { "url": "https://launchermeta.mojang.com/**" }
+      ]
+    }
   ]
 }
