@@ -46,7 +46,7 @@ jobs:
 
       - name: Build Tauri
         working-directory: sodium-launcher
-        run: npm run tauri build -- --no-before-build
+        run: npm run tauri build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
