@@ -16,6 +16,8 @@
         "width": 900,
         "height": 600,
         "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
         "devtools": true,
         "transparent": false
       }

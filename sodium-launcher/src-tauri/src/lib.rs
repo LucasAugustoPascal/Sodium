@@ -25,14 +25,84 @@ fn get_game_dir() -> Result<std::path::PathBuf, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let base = dirs::data_dir().ok_or("AppData introuvable")?;
-        Ok(base.join("sodium"))
+        let base = dirs::data_dir().ok_or("AppData\\Roaming introuvable")?;
+        Ok(base.join(".sodium"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let base = dirs::home_dir().ok_or("Home introuvable")?;
         Ok(base.join(".sodium"))
     }
+}
+
+/// Retourne le nom de l'OS tel qu'utilisé dans les JSON Mojang/Fabric
+/// Mojang utilise "osx" pour macOS et "windows" pour Windows
+fn mojang_os_name() -> &'static str {
+    #[cfg(target_os = "macos")]    { "osx" }
+    #[cfg(target_os = "windows")]  { "windows" }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))] { "linux" }
+}
+
+/// Extrait un JAR natif dans `dest_dir` sans dépendre du binaire `jar`
+/// Utilise la crate zip intégrée via std (nécessite la dépendance `zip` dans Cargo.toml)
+fn extract_native_jar(jar_path: &std::path::Path, dest_dir: &std::path::Path) -> Result<(), String> {
+    let file  = std::fs::File::open(jar_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+
+        // On ne garde que les fichiers natifs pertinents (.dll, .dylib, .so)
+        // et on ignore les métadonnées META-INF
+        if name.starts_with("META-INF") { continue; }
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !matches!(ext, "dll" | "dylib" | "so") { continue; }
+
+        // Aplatir : on ne conserve que le nom de fichier (pas le chemin interne)
+        let filename = std::path::Path::new(&name)
+            .file_name()
+            .ok_or_else(|| format!("Nom invalide dans le JAR : {}", name))?;
+
+        let out_path = dest_dir.join(filename);
+        if out_path.exists() { continue; }
+
+        let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+        eprintln!("[Natif] ✅ Extrait : {}", filename.to_string_lossy());
+    }
+    Ok(())
+}
+
+/// Évalue si une librairie doit être incluse selon ses règles `allow`/`disallow`
+fn library_is_allowed(lib: &serde_json::Value) -> bool {
+    let rules = match lib["rules"].as_array() {
+        Some(r) => r,
+        None    => return true, // Pas de règles = toujours incluse
+    };
+
+    let os = mojang_os_name();
+    // On part du principe "refusé par défaut" s'il y a des règles
+    let mut allowed = false;
+
+    for rule in rules {
+        let action   = rule["action"].as_str().unwrap_or("disallow");
+        let os_name  = rule["os"]["name"].as_str();
+
+        match (action, os_name) {
+            // Règle globale sans restriction d'OS
+            ("allow", None)    => { allowed = true; }
+            ("disallow", None) => { allowed = false; }
+            // Règle ciblant un OS précis
+            ("allow", Some(target_os))    => { if target_os == os { allowed = true; } }
+            ("disallow", Some(target_os)) => { if target_os == os { allowed = false; } }
+            _ => {}
+        }
+    }
+    allowed
 }
 
 #[tauri::command]
@@ -42,8 +112,8 @@ async fn install_version(window: tauri::Window, version: String) -> Result<(), S
     let version_dir = game_dir.join("versions").join(&version);
     std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
 
-    let jar_path   = version_dir.join(format!("{}.jar", version));
-    let json_path  = version_dir.join(format!("{}.json", version));
+    let jar_path    = version_dir.join(format!("{}.jar", version));
+    let json_path   = version_dir.join(format!("{}.json", version));
     let indexes_dir = game_dir.join("assets").join("indexes");
 
     let _ = window.emit("install_progress", serde_json::json!({
@@ -330,49 +400,40 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
         cp_parts.push(jar.to_string_lossy().into_owned());
     }
 
+    // Clé native selon l'OS courant (convention Mojang)
+    let natives_key = if cfg!(target_os = "windows")     { "natives-windows" }
+                      else if cfg!(target_os = "macos")  { "natives-osx" }
+                      else                               { "natives-linux" };
+
+    let natives_dir = game_dir.join("natives");
+    std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
+
     for lib in &all_libraries {
-        // Vérification des règles OS (natives Windows à exclure du classpath)
-        if let Some(rules) = lib["rules"].as_array() {
-            let allowed = rules.iter().any(|rule| {
-                let action = rule["action"].as_str().unwrap_or("disallow");
-                let os_name = rule["os"]["name"].as_str();
-                match (action, os_name) {
-                    ("allow", None)        => true,
-                    ("allow", Some(os))    => os == std::env::consts::OS || (cfg!(windows) && os == "windows") || (cfg!(target_os = "macos") && os == "osx") || (cfg!(target_os = "linux") && os == "linux"),
-                    ("disallow", Some(os)) => !((cfg!(windows) && os == "windows") || (cfg!(target_os = "macos") && os == "osx") || (cfg!(target_os = "linux") && os == "linux")),
-                    _ => false,
-                }
-            });
-            if !allowed {
-                continue;
-            }
+        // Filtrer selon les règles OS du manifest
+        if !library_is_allowed(lib) {
+            continue;
         }
 
-        // Natifs : on extrait mais on n'ajoute PAS au classpath
+        // Natifs : extraire les fichiers .dll / .dylib / .so, ne PAS ajouter au classpath
         if lib["natives"].is_object() {
-            let natives_key = if cfg!(windows) { "natives-windows" }
-                              else if cfg!(target_os = "macos") { "natives-osx" }
-                              else { "natives-linux" };
-
             if let Some(classifier) = lib["downloads"]["classifiers"][natives_key].as_object() {
                 let native_path_str = classifier["path"].as_str().unwrap_or("");
                 if !native_path_str.is_empty() {
                     let native_full = libs_dir.join(native_path_str);
                     if native_full.exists() {
-                        // Extraction des natifs dans un dossier dédié
-                        let natives_dir = game_dir.join("natives");
-                        std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
-                        let _ = std::process::Command::new("jar")
-                            .args(["xf", &native_full.to_string_lossy()])
-                            .current_dir(&natives_dir)
-                            .output();
-                        eprintln!("[Launch] Natif extrait: {}", native_path_str);
+                        // Extraction sans dépendre du binaire `jar` externe
+                        if let Err(e) = extract_native_jar(&native_full, &natives_dir) {
+                            eprintln!("[Launch] ⚠️ Extraction native échouée ({}): {}", native_path_str, e);
+                        } else {
+                            eprintln!("[Launch] Natif extrait: {}", native_path_str);
+                        }
                     }
                 }
             }
-            continue; // Ne pas ajouter les jars natifs au classpath
+            continue; // Ne pas ajouter les JARs natifs au classpath
         }
 
+        // Librairie normale via downloads.artifact
         if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
             let full = libs_dir.join(path);
             if full.exists() {
@@ -382,6 +443,8 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
             }
             continue;
         }
+
+        // Librairie Fabric (nom Maven, pas de downloads.artifact)
         if let Some(lib_name) = lib["name"].as_str() {
             let parts: Vec<&str> = lib_name.splitn(3, ':').collect();
             if parts.len() == 3 {
@@ -402,23 +465,29 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
 
     eprintln!("[Launch] {} entries dans le classpath", cp_parts.len());
 
-    let separator = if cfg!(windows) { ";" } else { ":" };
+    // Séparateur de classpath : `;` sur Windows, `:` ailleurs
+    let separator = if cfg!(target_os = "windows") { ";" } else { ":" };
     let classpath  = cp_parts.join(separator);
 
-    // Résolution du binaire Java
     let java_bin = find_java_binary();
     eprintln!("[Launch] Java: {}", java_bin);
-
-    let natives_dir = game_dir.join("natives");
-    std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
 
     let mut cmd = Command::new(&java_bin);
     cmd.current_dir(&game_dir);
     cmd.arg("-Xmx2G");
     cmd.arg(format!("-Djava.library.path={}", natives_dir.to_string_lossy()));
 
+    // -XstartOnFirstThread est requis uniquement sur macOS (contrainte LWJGL/OpenGL)
     #[cfg(target_os = "macos")]
     cmd.arg("-XstartOnFirstThread");
+
+    // Sur Windows, on masque la fenêtre de console de javaw
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     cmd.arg("-cp").arg(&classpath)
        .arg(&main_class)
@@ -434,7 +503,10 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
     eprintln!("[Launch] Lancement : {} avec mainClass {}", version, main_class);
 
     let child = cmd.spawn()
-        .map_err(|e| format!("Erreur lancement Java ({}): {}. Java est-il installé et dans le PATH ?", java_bin, e))?;
+        .map_err(|e| format!(
+            "Erreur lancement Java ({}): {}. Java est-il installé et dans le PATH ?",
+            java_bin, e
+        ))?;
 
     eprintln!("[Launch] ✅ Processus démarré, PID: {}", child.id());
     Ok(())
@@ -442,32 +514,33 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
 
 /// Trouve le binaire Java selon l'OS et les variables d'environnement
 fn find_java_binary() -> String {
-    // 1. JAVA_HOME défini explicitement
+    // 1. JAVA_HOME explicitement défini
     if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        let bin = if cfg!(windows) {
-            format!("{}\\bin\\javaw.exe", java_home)
-        } else {
-            format!("{}/bin/java", java_home)
-        };
+        #[cfg(target_os = "windows")]
+        let bin = format!("{}\\bin\\javaw.exe", java_home);
+        #[cfg(not(target_os = "windows"))]
+        let bin = format!("{}/bin/java", java_home);
+
         if std::path::Path::new(&bin).exists() {
             return bin;
         }
     }
 
-    // 2. Java livré avec le launcher (chemin relatif)
-    let bundled = if cfg!(windows) {
-        "runtime\\java\\bin\\javaw.exe"
-    } else if cfg!(target_os = "macos") {
-        "runtime/java/bin/java"
-    } else {
-        "runtime/java/bin/java"
-    };
+    // 2. Java livré avec le launcher (chemin relatif depuis le répertoire courant)
+    #[cfg(target_os = "windows")]
+    let bundled = "runtime\\java\\bin\\javaw.exe";
+    #[cfg(not(target_os = "windows"))]
+    let bundled = "runtime/java/bin/java";
+
     if std::path::Path::new(bundled).exists() {
         return bundled.to_string();
     }
 
-    // 3. Fallback PATH système
-    if cfg!(windows) { "javaw.exe".to_string() } else { "java".to_string() }
+    // 3. Fallback : Java du PATH système
+    #[cfg(target_os = "windows")]
+    { "javaw.exe".to_string() }
+    #[cfg(not(target_os = "windows"))]
+    { "java".to_string() }
 }
 
 #[tauri::command]
