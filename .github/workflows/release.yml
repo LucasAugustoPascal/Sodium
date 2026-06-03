@@ -23,14 +23,17 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: sodium-launcher/package-lock.json
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
+        working-directory: sodium-launcher
         run: npm ci
 
-      - name: Debug package.json
+      - name: Debug sodium-launcher/package.json
+        working-directory: sodium-launcher
         run: |
           echo "Current directory:"
           pwd
@@ -38,14 +41,15 @@ jobs:
           npm run
 
       - name: Build Frontend
+        working-directory: sodium-launcher
         run: npm run build
 
       - name: Build Tauri
+        working-directory: sodium-launcher
         run: npm run tauri build -- --no-before-build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.platform }}
-          path: |
-            src-tauri/target/release/bundle/**
+          path: sodium-launcher/src-tauri/target/release/bundle/**
