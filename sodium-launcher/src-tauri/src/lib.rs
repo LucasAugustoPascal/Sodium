@@ -1,4 +1,3 @@
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -8,6 +7,7 @@ use url::form_urlencoded;
 use dirs;
 use serde::Deserialize;
 use tauri::Emitter;
+use tauri::Manager;
 
 #[derive(Deserialize)]
 struct LaunchOptions {
@@ -18,13 +18,19 @@ struct LaunchOptions {
 }
 
 fn get_game_dir() -> Result<std::path::PathBuf, String> {
-    let base = dirs::home_dir().ok_or("Home introuvable")?;
     #[cfg(target_os = "macos")]
     {
+        let base = dirs::home_dir().ok_or("Home introuvable")?;
         Ok(base.join("Library").join("Application Support").join("sodium"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
+        let base = dirs::data_dir().ok_or("AppData introuvable")?;
+        Ok(base.join("sodium"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let base = dirs::home_dir().ok_or("Home introuvable")?;
         Ok(base.join(".sodium"))
     }
 }
@@ -263,9 +269,9 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
     let uuid         = args.uuid;
     let name         = args.name;
 
-    let game_dir         = get_game_dir()?;
-    let versions_dir     = game_dir.join("versions").join(&version);
-    let libs_dir         = game_dir.join("libraries");
+    let game_dir          = get_game_dir()?;
+    let versions_dir      = game_dir.join("versions").join(&version);
+    let libs_dir          = game_dir.join("libraries");
     let version_json_path = versions_dir.join(format!("{}.json", version));
 
     let content = std::fs::read_to_string(&version_json_path)
@@ -325,6 +331,48 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
     }
 
     for lib in &all_libraries {
+        // Vérification des règles OS (natives Windows à exclure du classpath)
+        if let Some(rules) = lib["rules"].as_array() {
+            let allowed = rules.iter().any(|rule| {
+                let action = rule["action"].as_str().unwrap_or("disallow");
+                let os_name = rule["os"]["name"].as_str();
+                match (action, os_name) {
+                    ("allow", None)        => true,
+                    ("allow", Some(os))    => os == std::env::consts::OS || (cfg!(windows) && os == "windows") || (cfg!(target_os = "macos") && os == "osx") || (cfg!(target_os = "linux") && os == "linux"),
+                    ("disallow", Some(os)) => !((cfg!(windows) && os == "windows") || (cfg!(target_os = "macos") && os == "osx") || (cfg!(target_os = "linux") && os == "linux")),
+                    _ => false,
+                }
+            });
+            if !allowed {
+                continue;
+            }
+        }
+
+        // Natifs : on extrait mais on n'ajoute PAS au classpath
+        if lib["natives"].is_object() {
+            let natives_key = if cfg!(windows) { "natives-windows" }
+                              else if cfg!(target_os = "macos") { "natives-osx" }
+                              else { "natives-linux" };
+
+            if let Some(classifier) = lib["downloads"]["classifiers"][natives_key].as_object() {
+                let native_path_str = classifier["path"].as_str().unwrap_or("");
+                if !native_path_str.is_empty() {
+                    let native_full = libs_dir.join(native_path_str);
+                    if native_full.exists() {
+                        // Extraction des natifs dans un dossier dédié
+                        let natives_dir = game_dir.join("natives");
+                        std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
+                        let _ = std::process::Command::new("jar")
+                            .args(["xf", &native_full.to_string_lossy()])
+                            .current_dir(&natives_dir)
+                            .output();
+                        eprintln!("[Launch] Natif extrait: {}", native_path_str);
+                    }
+                }
+            }
+            continue; // Ne pas ajouter les jars natifs au classpath
+        }
+
         if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
             let full = libs_dir.join(path);
             if full.exists() {
@@ -357,8 +405,17 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
     let separator = if cfg!(windows) { ";" } else { ":" };
     let classpath  = cp_parts.join(separator);
 
-    let mut cmd = Command::new("java");
-    cmd.current_dir(&game_dir).arg("-Xmx2G");
+    // Résolution du binaire Java
+    let java_bin = find_java_binary();
+    eprintln!("[Launch] Java: {}", java_bin);
+
+    let natives_dir = game_dir.join("natives");
+    std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(&java_bin);
+    cmd.current_dir(&game_dir);
+    cmd.arg("-Xmx2G");
+    cmd.arg(format!("-Djava.library.path={}", natives_dir.to_string_lossy()));
 
     #[cfg(target_os = "macos")]
     cmd.arg("-XstartOnFirstThread");
@@ -371,11 +428,46 @@ async fn launch_minecraft(args: LaunchOptions) -> Result<(), String> {
        .arg("--version").arg(&version)
        .arg("--gameDir").arg(&game_dir)
        .arg("--assetsDir").arg(game_dir.join("assets"))
-       .arg("--assetIndex").arg(&asset_index_id);
+       .arg("--assetIndex").arg(&asset_index_id)
+       .arg("--userType").arg("msa");
 
     eprintln!("[Launch] Lancement : {} avec mainClass {}", version, main_class);
-    cmd.spawn().map_err(|e| format!("Erreur lancement Java : {}", e))?;
+
+    let child = cmd.spawn()
+        .map_err(|e| format!("Erreur lancement Java ({}): {}. Java est-il installé et dans le PATH ?", java_bin, e))?;
+
+    eprintln!("[Launch] ✅ Processus démarré, PID: {}", child.id());
     Ok(())
+}
+
+/// Trouve le binaire Java selon l'OS et les variables d'environnement
+fn find_java_binary() -> String {
+    // 1. JAVA_HOME défini explicitement
+    if let Ok(java_home) = std::env::var("JAVA_HOME") {
+        let bin = if cfg!(windows) {
+            format!("{}\\bin\\javaw.exe", java_home)
+        } else {
+            format!("{}/bin/java", java_home)
+        };
+        if std::path::Path::new(&bin).exists() {
+            return bin;
+        }
+    }
+
+    // 2. Java livré avec le launcher (chemin relatif)
+    let bundled = if cfg!(windows) {
+        "runtime\\java\\bin\\javaw.exe"
+    } else if cfg!(target_os = "macos") {
+        "runtime/java/bin/java"
+    } else {
+        "runtime/java/bin/java"
+    };
+    if std::path::Path::new(bundled).exists() {
+        return bundled.to_string();
+    }
+
+    // 3. Fallback PATH système
+    if cfg!(windows) { "javaw.exe".to_string() } else { "java".to_string() }
 }
 
 #[tauri::command]
@@ -547,6 +639,34 @@ async fn write_config(filename: String, content: String) -> Result<(), String> {
     std::fs::write(config_dir.join(&filename), content).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn install_bundled_mods(app: tauri::AppHandle) -> Result<(), String> {
+    let game_dir = get_game_dir()?;
+    let mods_dir = game_dir.join("mods");
+    std::fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
+
+    let mod_files = ["fabric-api.jar", "sodiummod.jar"];
+
+    for filename in &mod_files {
+        let dest = mods_dir.join(filename);
+        if dest.exists() { continue; }
+
+        let resource_path = app.path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?
+            .join("resources")
+            .join("mods")
+            .join(filename);
+
+        std::fs::copy(&resource_path, &dest)
+            .map_err(|e| format!("Erreur copie {} : {}", filename, e))?;
+
+        eprintln!("[Mods] ✅ Installé : {}", filename);
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -554,6 +674,12 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let window = app.get_webview_window("main").unwrap();
+            window.set_resizable(false).unwrap();
+            window.set_maximizable(false).unwrap();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_microsoft_auth,
             exchange_microsoft_token,
@@ -566,6 +692,7 @@ pub fn run() {
             delete_mod,
             read_config,
             write_config,
+            install_bundled_mods,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

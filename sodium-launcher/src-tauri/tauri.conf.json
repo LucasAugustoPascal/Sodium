@@ -27,7 +27,8 @@
   "bundle": {
     "active": true,
     "resources": [
-      "launcher/launcher.js"
+      "launcher/launcher.js",
+      "resources/mods/*"
     ],
     "targets": "all",
     "icon": [

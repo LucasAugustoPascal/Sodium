@@ -307,8 +307,9 @@
                     ? { ...i, lastPlayed: new Date().toLocaleDateString('fr-FR') }
                     : i
             );
-            await saveInstances();
 
+            await saveInstances();
+            await invoke('install_bundled_mods');
             await invoke("launch_minecraft", {
                 args: {
                     version: versionToLaunch,
