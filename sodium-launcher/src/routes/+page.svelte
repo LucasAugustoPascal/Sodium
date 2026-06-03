@@ -2,9 +2,11 @@
     import MicrosoftOauth2 from "../libs/MicrosoftOauth2";
     import { invoke } from '@tauri-apps/api/core';
     import { open } from '@tauri-apps/plugin-shell';
-    import { load } from '@tauri-apps/plugin-store';
-    import Button, { Label, Icon } from '@smui/button';
+    import Button, { Label } from '@smui/button';
     import Card, { Content, Actions } from '@smui/card';
+    import { open as openDialog } from '@tauri-apps/plugin-dialog';
+    import { listen } from '@tauri-apps/api/event';
+
 
     const auth = new MicrosoftOauth2(
         "dd919c86-6d2d-4471-a06b-1eac8f6d35a8",
@@ -27,24 +29,39 @@
         releaseTime: string;
     }
 
+    const SODIUM_INSTANCE: MinecraftInstance = {
+        id: "sodium-builtin",
+        name: "Sodium",
+        version: "1.21.11",
+        lastPlayed: undefined
+    };
+
     let username = $state("");
     let avatar = $state(DEFAULT_AVATAR);
+    let access_token = $state("");
+    let uuid = $state("");
     let loading = $state(false);
     let error = $state("");
     let authInProgress = $state(false);
     let activePage = $state("play");
 
-    // Instances
     let instances = $state<MinecraftInstance[]>([]);
     let selectedInstanceId = $state<string | null>(null);
     let showAddModal = $state(false);
     let newInstanceName = $state("");
     let newInstanceVersion = $state("1.21.4");
 
-    // Versions Mojang
     let availableVersions = $state<MCVersion[]>([]);
     let showSnapshots = $state(false);
     let versionsLoading = $state(false);
+
+    let isLaunching = $state(false);
+    let globalLaunching = $state(false);
+    let launchProgress = $state(0);
+    let launchStatus = $state("");
+
+    let mods = $state<string[]>([]);
+    let modsLoading = $state(false);
 
     const filteredVersions = $derived(
         showSnapshots
@@ -53,29 +70,35 @@
     );
 
     const selectedInstance = $derived(
-        instances.find(i => i.id === selectedInstanceId) ?? null
+        selectedInstanceId === SODIUM_INSTANCE.id
+            ? SODIUM_INSTANCE
+            : instances.find(i => i.id === selectedInstanceId) ?? null
     );
+
+    async function loadConfig<T>(filename: string): Promise<T> {
+        const raw = await invoke<string>('read_config', { filename });
+        return JSON.parse(raw) as T;
+    }
+
+    async function saveConfig(filename: string, data: unknown): Promise<void> {
+        await invoke('write_config', { filename, content: JSON.stringify(data) });
+    }
 
     async function fetchVersions() {
         versionsLoading = true;
         try {
-            const versions = await auth.getVersion(true)
+            const versions = await auth.getVersion(true);
             availableVersions = versions;
             if (!newInstanceVersion) {
                 newInstanceVersion = versions.find(v => v.type === "release")?.id ?? "1.21.4";
             }
         } catch (e) {
             console.error("❌ Impossible de récupérer les versions :", e);
-            // Fallback
             availableVersions = [
                 { id: "1.21.4", type: "release", releaseTime: "" },
                 { id: "1.21.1", type: "release", releaseTime: "" },
                 { id: "1.20.4", type: "release", releaseTime: "" },
                 { id: "1.20.1", type: "release", releaseTime: "" },
-                { id: "1.19.4", type: "release", releaseTime: "" },
-                { id: "1.18.2", type: "release", releaseTime: "" },
-                { id: "1.17.1", type: "release", releaseTime: "" },
-                { id: "1.16.5", type: "release", releaseTime: "" },
             ];
         } finally {
             versionsLoading = false;
@@ -86,43 +109,49 @@
         (async () => {
             try {
                 // Session
-                const sessionStore = await load('session.json', { autoSave: true, defaults: {} });
-                const session = await sessionStore.get<{
+                const session = await loadConfig<{
                     username: string;
                     avatar: string;
                     refresh_token: string;
-                }>('mc_session');
+                    access_token: string;
+                    uuid: string;
+                } | null>('session.json');
 
                 if (session?.username) {
                     username = session.username;
                     avatar = session.avatar || DEFAULT_AVATAR;
+                    access_token = session.access_token;
+                    uuid = session.uuid;
 
                     if (session.refresh_token) {
                         try {
                             const newAuth = await auth.refreshAuth(session.refresh_token);
-                            await sessionStore.set('mc_session', {
-                                username, avatar,
-                                refresh_token: newAuth.auth_token.refresh_token
+                            access_token = newAuth.mc_token.access_token;
+                            await saveConfig('session.json', {
+                                username,
+                                avatar,
+                                refresh_token: newAuth.auth_token.refresh_token,
+                                access_token: newAuth.mc_token.access_token,
+                                uuid: session.uuid,
                             });
                             console.log("✅ Token renouvelé");
                         } catch (e) {
                             console.error("❌ Refresh échoué :", e);
                             username = ""; avatar = DEFAULT_AVATAR;
-                            await sessionStore.delete('mc_session');
+                            await saveConfig('session.json', {});
                         }
                     }
                 }
 
                 // Instances
-                const instanceStore = await load('instances.json', { autoSave: true, defaults: {} });
-                const saved = await instanceStore.get<{ list: MinecraftInstance[]; selectedId: string }>('instances');
+                const saved = await loadConfig<{ list: MinecraftInstance[]; selectedId: string } | null>('instances.json');
                 if (saved?.list?.length) {
                     instances = saved.list;
                     selectedInstanceId = saved.selectedId ?? saved.list[0].id;
                 }
 
-                // Versions Mojang
                 await fetchVersions();
+                await loadMods();
 
             } catch (e) {
                 console.error("❌ Erreur chargement :", e);
@@ -130,9 +159,34 @@
         })();
     });
 
+    async function loadMods() {
+        modsLoading = true;
+        try {
+            mods = await invoke<string[]>("list_mods");
+        } catch (e) {
+            console.error("Erreur chargement mods :", e);
+        } finally {
+            modsLoading = false;
+        }
+    }
+
+    async function importMod() {
+        const selected = await openDialog({
+            filters: [{ name: "Mod Fabric", extensions: ["jar"] }],
+            multiple: false,
+        });
+        if (!selected) return;
+        await invoke("install_local_mod", { sourcePath: selected as string });
+        await loadMods();
+    }
+
+    async function removeMod(filename: string) {
+        await invoke("delete_mod", { filename });
+        await loadMods();
+    }
+
     async function saveInstances() {
-        const instanceStore = await load('instances.json', { autoSave: true, defaults: {} });
-        await instanceStore.set('instances', { list: instances, selectedId: selectedInstanceId });
+        await saveConfig('instances.json', { list: instances, selectedId: selectedInstanceId });
     }
 
     async function addInstance() {
@@ -180,15 +234,16 @@
         try {
             const authInfo = await auth.getAuthCodes(code, false, verifier);
             username = authInfo.mc_info?.name || "";
-            let uuid = authInfo.mc_info?.id;
-            if (uuid) {
-                uuid = uuid.replace(/-/g, '');
-                avatar = `https://mc-heads.net/avatar/${uuid}/100`;
-            } else { avatar = DEFAULT_AVATAR; }
-            const store = await load('session.json', { autoSave: true, defaults: {} });
-            await store.set('mc_session', {
-                username, avatar,
-                refresh_token: authInfo.auth_token.refresh_token
+            const rawUuid = authInfo.mc_info?.id ?? "";
+            uuid = rawUuid.replace(/-/g, '');
+            avatar = uuid ? `https://mc-heads.net/avatar/${uuid}/100` : DEFAULT_AVATAR;
+
+            await saveConfig('session.json', {
+                username,
+                avatar,
+                refresh_token: authInfo.auth_token.refresh_token,
+                access_token: authInfo.mc_token.access_token,
+                uuid,
             });
         } catch (e: any) {
             error = "Échec de l'authentification Minecraft.";
@@ -201,22 +256,84 @@
     }
 
     async function logout() {
-        try {
-            const store = await load('session.json', { autoSave: true, defaults: {} });
-            await store.delete('mc_session');
-        } catch (e) {}
+        await saveConfig('session.json', {});
         username = ""; avatar = DEFAULT_AVATAR; error = "";
     }
 
     async function launchGame() {
-        if (!selectedInstance) return;
-        instances = instances.map(i =>
-            i.id === selectedInstance.id
-                ? { ...i, lastPlayed: new Date().toLocaleDateString('fr-FR') }
-                : i
-        );
-        await saveInstances();
-        console.log(`🚀 Lancement → ${selectedInstance.name} | ${selectedInstance.version}`);
+        if (!selectedInstance || isLaunching || globalLaunching) return;
+        isLaunching = true;
+        globalLaunching = true;
+        error = "";
+        launchProgress = 0;
+        launchStatus = "";
+
+        let unlisten: (() => void) | null = null;
+
+        try {
+            // Écoute les events de progression
+            unlisten = await listen<{ stage: string; percent: number; label: string }>(
+                'install_progress',
+                (event) => {
+                    launchStatus  = event.payload.label;
+                    // On mappe la progression install sur 0–80%, le reste pour Fabric + lancement
+                    launchProgress = Math.round(event.payload.percent * 0.8);
+                }
+            );
+
+            let versionToLaunch = selectedInstance.version;
+
+            if (selectedInstance.id === SODIUM_INSTANCE.id) {
+                await invoke("install_version", { version: "1.21.11" });
+
+                launchStatus   = "Installation de Fabric...";
+                launchProgress = 82;
+                versionToLaunch = await invoke<string>("install_fabric", {
+                    minecraftVersion: "1.21.11"
+                });
+
+                launchStatus   = "Fabric prêt !";
+                launchProgress = 90;
+            } else {
+                await invoke("install_version", { version: selectedInstance.version });
+                launchProgress = 82;
+            }
+
+            launchStatus   = "Lancement de Minecraft...";
+            launchProgress = 95;
+
+            instances = instances.map(i =>
+                i.id === selectedInstance!.id
+                    ? { ...i, lastPlayed: new Date().toLocaleDateString('fr-FR') }
+                    : i
+            );
+            await saveInstances();
+
+            await invoke("launch_minecraft", {
+                args: {
+                    version: versionToLaunch,
+                    access_token,
+                    uuid,
+                    name: username,
+                }
+            });
+
+            launchStatus   = "Minecraft lancé ! 🎮";
+            launchProgress = 100;
+            await new Promise(r => setTimeout(r, 3000));
+
+        } catch (e: any) {
+            console.error("❌ Erreur critique lors du lancement :", e);
+            error        = `Erreur lors du lancement : ${e}`;
+            launchStatus = "";
+            launchProgress = 0;
+        } finally {
+            unlisten?.();
+            isLaunching    = false;
+            globalLaunching = false;
+            launchStatus   = "";
+            launchProgress = 0;
+        }
     }
 
     const navItems = [
@@ -229,7 +346,6 @@
 {#if username}
     <div class="app-layout">
 
-        <!-- ═══ SIDEBAR ═══ -->
         <aside class="sidebar">
             <div class="sidebar-logo">
                 <div class="logo-icon">
@@ -265,39 +381,76 @@
             </div>
         </aside>
 
-        <!-- ═══ CONTENU ═══ -->
         <main class="main-content">
 
-            <!-- PAGE JOUER -->
             {#if activePage === "play"}
                 <div class="page-play">
                     <div class="play-header">
                         <div>
-                            <h1>Bonjour, <span class="accent">{username}</span> 👋</h1>
+                            <h1><span class="accent">{username}</span></h1>
                             <p>Sélectionne une instance et lance le jeu.</p>
                         </div>
-                        <button class="btn-add" onclick={() => showAddModal = true}>
+                        <button class="btn-add" onclick={() => showAddModal = true} disabled={globalLaunching}>
                             <span class="material-icons">add</span>
                             Nouvelle instance
                         </button>
                     </div>
 
-                    {#if instances.length === 0}
-                        <div class="empty-state">
-                            <span class="material-icons empty-icon">inbox</span>
-                            <p>Aucune instance pour le moment.</p>
-                            <button class="btn-add" onclick={() => showAddModal = true}>
-                                <span class="material-icons">add</span>
-                                Créer une instance
-                            </button>
+                    <div class="instances-list">
+                        <!-- Instance Sodium épinglée -->
+                        <div
+                                class="instance-card pinned"
+                                class:selected={selectedInstanceId === SODIUM_INSTANCE.id}
+                                class:disabled={globalLaunching}
+                                onclick={() => { if (!globalLaunching) selectedInstanceId = SODIUM_INSTANCE.id; }}
+                                role="button"
+                                tabindex="0"
+                        >
+                            <div class="instance-icon pinned-icon">
+                                <span class="material-icons">water_drop</span>
+                            </div>
+                            <div class="instance-info">
+                                <span class="instance-name">
+                                    Sodium
+                                    <span class="pinned-badge">Officiel</span>
+                                </span>
+                                <span class="instance-meta">Java Edition · 1.21.11</span>
+                            </div>
+                            <div class="instance-actions">
+                                {#if selectedInstanceId === SODIUM_INSTANCE.id}
+                                    <button
+                                            class="btn-play"
+                                            onclick={(e) => { e.stopPropagation(); launchGame(); }}
+                                            disabled={globalLaunching}
+                                    >
+                                        {#if globalLaunching && selectedInstanceId === SODIUM_INSTANCE.id}
+                                            <span class="spinner-sm"></span>
+                                            En cours...
+                                        {:else}
+                                            <span class="material-icons">play_arrow</span>
+                                            Lancer
+                                        {/if}
+                                    </button>
+                                {/if}
+                            </div>
                         </div>
-                    {:else}
-                        <div class="instances-list">
+
+                        {#if instances.length === 0}
+                            <div class="empty-state">
+                                <span class="material-icons empty-icon">inbox</span>
+                                <p>Aucune instance pour le moment.</p>
+                                <button class="btn-add" onclick={() => showAddModal = true}>
+                                    <span class="material-icons">add</span>
+                                    Créer une instance
+                                </button>
+                            </div>
+                        {:else}
                             {#each instances as inst}
                                 <div
                                         class="instance-card"
                                         class:selected={selectedInstanceId === inst.id}
-                                        onclick={() => selectedInstanceId = inst.id}
+                                        class:disabled={globalLaunching}
+                                        onclick={() => { if (!globalLaunching) selectedInstanceId = inst.id; }}
                                         role="button"
                                         tabindex="0"
                                 >
@@ -313,12 +466,79 @@
                                     </div>
                                     <div class="instance-actions">
                                         {#if selectedInstanceId === inst.id}
-                                            <button class="btn-play" onclick={(e) => { e.stopPropagation(); launchGame(); }}>
-                                                <span class="material-icons">play_arrow</span>
-                                                Lancer
+                                            <button
+                                                    class="btn-play"
+                                                    onclick={(e) => { e.stopPropagation(); launchGame(); }}
+                                                    disabled={globalLaunching}
+                                            >
+                                                {#if globalLaunching && selectedInstanceId === inst.id}
+                                                    <span class="spinner-sm"></span>
+                                                    En cours...
+                                                {:else}
+                                                    <span class="material-icons">play_arrow</span>
+                                                    Lancer
+                                                {/if}
                                             </button>
                                         {/if}
-                                        <button class="btn-delete" onclick={(e) => { e.stopPropagation(); deleteInstance(inst.id); }} title="Supprimer">
+                                        <button
+                                                class="btn-delete"
+                                                onclick={(e) => { e.stopPropagation(); deleteInstance(inst.id); }}
+                                                disabled={globalLaunching}
+                                                title="Supprimer"
+                                        >
+                                            <span class="material-icons">delete_outline</span>
+                                        </button>
+                                    </div>
+                                </div>
+                            {/each}
+                        {/if}
+                    </div>
+                </div>
+
+            {:else if activePage === "mods"}
+                <div class="page-mods">
+                    <div class="play-header">
+                        <div>
+                            <h1>Mods <span class="accent">Fabric</span></h1>
+                            <p>Ces mods seront chargés avec la version Sodium officielle.</p>
+                        </div>
+                        <button class="btn-add" onclick={importMod}>
+                            <span class="material-icons">file_upload</span>
+                            Importer un .jar
+                        </button>
+                    </div>
+
+                    {#if modsLoading}
+                        <div class="versions-loading">
+                            <span class="spinner-sm"></span>
+                            Chargement des mods...
+                        </div>
+                    {:else if mods.length === 0}
+                        <div class="empty-state">
+                            <span class="material-icons empty-icon">extension_off</span>
+                            <p>Aucun mod installé.</p>
+                            <button class="btn-add" onclick={importMod}>
+                                <span class="material-icons">file_upload</span>
+                                Importer un .jar
+                            </button>
+                        </div>
+                    {:else}
+                        <div class="instances-list">
+                            {#each mods as mod}
+                                <div class="instance-card">
+                                    <div class="instance-icon">
+                                        <span class="material-icons">extension</span>
+                                    </div>
+                                    <div class="instance-info">
+                                        <span class="instance-name">{mod}</span>
+                                        <span class="instance-meta">.minecraft/mods/</span>
+                                    </div>
+                                    <div class="instance-actions">
+                                        <button
+                                                class="btn-delete"
+                                                onclick={() => removeMod(mod)}
+                                                title="Supprimer"
+                                        >
                                             <span class="material-icons">delete_outline</span>
                                         </button>
                                     </div>
@@ -328,20 +548,39 @@
                     {/if}
                 </div>
 
-                <!-- PAGE MODS / SETTINGS -->
-            {:else if activePage === "mods" || activePage === "settings"}
+            {:else if activePage === "settings"}
                 <div class="page-placeholder">
-                    <span class="material-icons placeholder-icon">
-                        {activePage === "mods" ? "extension" : "settings"}
-                    </span>
-                    <h2>{activePage === "mods" ? "Mods" : "Paramètres"}</h2>
+                    <span class="material-icons placeholder-icon">settings</span>
+                    <h2>Paramètres</h2>
                     <p>Bientôt disponible</p>
                 </div>
             {/if}
         </main>
     </div>
 
-    <!-- ═══ MODAL NOUVELLE INSTANCE ═══ -->
+    <!-- Barre de lancement -->
+    {#if globalLaunching}
+        <div class="launch-overlay">
+            <div class="launch-card">
+                <div class="launch-icon">
+                    <span class="material-icons spinning">sports_esports</span>
+                </div>
+                <div class="launch-info">
+                    <span class="launch-label">{launchStatus}</span>
+                    <div class="progress-bar-track">
+                        <div
+                                class="progress-bar-fill"
+                                style="width: {launchProgress}%"
+                                class:done={launchProgress === 100}
+                        ></div>
+                    </div>
+                    <span class="launch-percent">{launchProgress}%</span>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    <!-- Modal nouvelle instance -->
     {#if showAddModal}
         <div class="modal-overlay" onclick={() => showAddModal = false} role="button" tabindex="0">
             <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog">
@@ -400,7 +639,6 @@
     {/if}
 
 {:else}
-    <!-- ═══ LOGIN ═══ -->
     <div class="login-container">
         <div class="card-wrapper">
             <Card class="glass-card">
@@ -445,14 +683,8 @@
         background: #0a0a0f; color: #fff;
     }
 
-    /* ═══════════════════════════
-       LAYOUT
-    ═══════════════════════════ */
     .app-layout { display: flex; height: 100vh; width: 100vw; overflow: hidden; }
 
-    /* ═══════════════════════════
-       SIDEBAR
-    ═══════════════════════════ */
     .sidebar {
         width: 220px; min-width: 220px; height: 100vh;
         background: rgba(8, 8, 18, 0.98);
@@ -510,9 +742,6 @@
     }
     .logout-icon:hover { color: #cf6679; background: rgba(207,102,121,0.1); }
 
-    /* ═══════════════════════════
-       MAIN CONTENT
-    ═══════════════════════════ */
     .main-content {
         flex: 1; overflow-y: auto;
         background:
@@ -522,9 +751,6 @@
         padding: 2rem 2.5rem; box-sizing: border-box;
     }
 
-    /* ═══════════════════════════
-       PAGE JOUER
-    ═══════════════════════════ */
     .page-play { display: flex; flex-direction: column; gap: 1.75rem; max-width: 800px; }
 
     .play-header {
@@ -540,10 +766,10 @@
         padding: 0.55rem 1rem; font-size: 0.875rem; font-weight: 600;
         cursor: pointer; transition: all 0.15s; white-space: nowrap;
     }
-    .btn-add:hover { background: rgba(0,200,150,0.15); border-color: rgba(0,200,150,0.45); }
+    .btn-add:hover:not(:disabled) { background: rgba(0,200,150,0.15); border-color: rgba(0,200,150,0.45); }
+    .btn-add:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-add .material-icons { font-size: 18px; }
 
-    /* Instances */
     .instances-list { display: flex; flex-direction: column; gap: 0.55rem; }
 
     .instance-card {
@@ -560,7 +786,7 @@
         width: 3px; background: transparent;
         border-radius: 14px 0 0 14px; transition: background 0.18s;
     }
-    .instance-card:hover {
+    .instance-card:hover:not(.disabled) {
         background: rgba(17,24,39,0.8);
         border-color: rgba(255,255,255,0.1);
         transform: translateX(2px);
@@ -572,13 +798,15 @@
     .instance-card.selected::before {
         background: linear-gradient(to bottom, #00c896, #00a8ff);
     }
+    .instance-card.disabled {
+        opacity: 0.6; cursor: not-allowed;
+    }
 
     .instance-icon {
         width: 42px; height: 42px; border-radius: 10px;
         background: rgba(0,200,150,0.08);
         border: 1px solid rgba(0,200,150,0.15);
         display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-        transition: all 0.18s;
     }
     .instance-card.selected .instance-icon {
         background: rgba(0,200,150,0.14);
@@ -600,7 +828,8 @@
         padding: 0.45rem 1rem; cursor: pointer; transition: all 0.15s;
         box-shadow: 0 3px 12px rgba(0,200,150,0.28);
     }
-    .btn-play:hover { box-shadow: 0 5px 20px rgba(0,200,150,0.45); transform: translateY(-1px); }
+    .btn-play:hover:not(:disabled) { box-shadow: 0 5px 20px rgba(0,200,150,0.45); transform: translateY(-1px); }
+    .btn-play:disabled { opacity: 0.45; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
     .btn-play .material-icons { font-size: 18px; }
 
     .btn-delete {
@@ -609,8 +838,23 @@
         padding: 6px; border-radius: 7px;
         display: flex; align-items: center; transition: all 0.15s;
     }
-    .btn-delete:hover { color: #cf6679; background: rgba(207,102,121,0.1); }
+    .btn-delete:hover:not(:disabled) { color: #cf6679; background: rgba(207,102,121,0.1); }
+    .btn-delete:disabled { opacity: 0.3; cursor: not-allowed; }
     .btn-delete .material-icons { font-size: 18px; }
+
+    /* Pinned */
+    .instance-card.pinned { border-color: rgba(0,168,255,0.25); background: rgba(0,168,255,0.04); }
+    .instance-card.pinned::before { background: linear-gradient(to bottom, #00a8ff, #6300ff); }
+    .instance-card.pinned.selected { border-color: rgba(0,168,255,0.4); background: rgba(0,168,255,0.08); }
+    .pinned-icon { background: rgba(0,168,255,0.08) !important; border-color: rgba(0,168,255,0.2) !important; }
+    .pinned-icon .material-icons { color: #00a8ff !important; }
+    .pinned-badge {
+        display: inline-flex; align-items: center;
+        background: rgba(0,168,255,0.12); border: 1px solid rgba(0,168,255,0.25);
+        color: #00a8ff; font-size: 0.65rem; font-weight: 700;
+        padding: 1px 6px; border-radius: 4px; margin-left: 0.5rem;
+        vertical-align: middle; letter-spacing: 0.04em; text-transform: uppercase;
+    }
 
     /* Empty state */
     .empty-state {
@@ -623,26 +867,86 @@
     .empty-icon { font-size: 3.5rem; color: rgba(255,255,255,0.08); }
     .empty-state p { margin: 0; font-size: 0.9rem; }
 
-    /* ═══════════════════════════
-       MODAL
-    ═══════════════════════════ */
+    /* Launch overlay */
+    .launch-overlay {
+        position: fixed; bottom: 2rem; left: 50%;
+        transform: translateX(-50%);
+        z-index: 200; width: min(480px, 90vw);
+        animation: slideUp 0.3s ease;
+    }
+
+    @keyframes slideUp {
+        from { opacity: 0; transform: translateX(-50%) translateY(20px); }
+        to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+
+    .launch-card {
+        display: flex; align-items: center; gap: 1rem;
+        background: rgba(13,17,23,0.95);
+        border: 1px solid rgba(0,200,150,0.25);
+        border-radius: 16px; padding: 1rem 1.25rem;
+        backdrop-filter: blur(20px);
+        box-shadow: 0 20px 50px rgba(0,0,0,0.6), 0 0 0 1px rgba(0,200,150,0.08);
+    }
+
+    .launch-icon {
+        width: 42px; height: 42px; border-radius: 12px;
+        background: rgba(0,200,150,0.1);
+        border: 1px solid rgba(0,200,150,0.2);
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    .launch-icon .material-icons { font-size: 22px; color: #00c896; }
+
+    .spinning { animation: spin 1.5s linear infinite; }
+
+    .launch-info {
+        flex: 1; display: flex; flex-direction: column;
+        gap: 0.4rem; min-width: 0;
+    }
+
+    .launch-label {
+        font-size: 0.82rem; font-weight: 600;
+        color: rgba(255,255,255,0.85);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .progress-bar-track {
+        width: 100%; height: 5px;
+        background: rgba(255,255,255,0.07);
+        border-radius: 99px; overflow: hidden;
+    }
+
+    .progress-bar-fill {
+        height: 100%; border-radius: 99px;
+        background: linear-gradient(90deg, #00c896, #00a8ff);
+        transition: width 0.4s ease;
+        box-shadow: 0 0 8px rgba(0,200,150,0.5);
+    }
+
+    .progress-bar-fill.done {
+        background: linear-gradient(90deg, #00c896, #00ff88);
+        box-shadow: 0 0 12px rgba(0,200,150,0.8);
+    }
+
+    .launch-percent {
+        font-size: 0.72rem; color: rgba(255,255,255,0.3);
+        font-variant-numeric: tabular-nums; align-self: flex-end;
+    }
+
+    /* Modal */
     .modal-overlay {
         position: fixed; inset: 0;
-        background: rgba(0,0,0,0.65);
-        backdrop-filter: blur(5px);
-        display: flex; align-items: center; justify-content: center;
-        z-index: 100;
+        background: rgba(0,0,0,0.65); backdrop-filter: blur(5px);
+        display: flex; align-items: center; justify-content: center; z-index: 100;
     }
     .modal {
-        background: #111827;
-        border: 1px solid rgba(255,255,255,0.09);
+        background: #111827; border: 1px solid rgba(255,255,255,0.09);
         border-radius: 18px; width: 420px; max-width: 92vw;
         box-shadow: 0 30px 70px rgba(0,0,0,0.65); overflow: hidden;
     }
     .modal-header {
         display: flex; align-items: center; justify-content: space-between;
-        padding: 1.25rem 1.5rem;
-        border-bottom: 1px solid rgba(255,255,255,0.07);
+        padding: 1.25rem 1.5rem; border-bottom: 1px solid rgba(255,255,255,0.07);
     }
     .modal-header h2 { margin: 0; font-size: 1rem; font-weight: 700; }
     .modal-close {
@@ -651,50 +955,35 @@
         display: flex; align-items: center; transition: all 0.15s;
     }
     .modal-close:hover { color: #fff; background: rgba(255,255,255,0.08); }
-
     .modal-body { padding: 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }
-
     .modal-footer {
         display: flex; justify-content: flex-end; gap: 0.75rem;
-        padding: 1rem 1.5rem;
-        border-top: 1px solid rgba(255,255,255,0.07);
+        padding: 1rem 1.5rem; border-top: 1px solid rgba(255,255,255,0.07);
     }
 
     .config-group { display: flex; flex-direction: column; gap: 0.4rem; }
-
-    .label-row {
-        display: flex; align-items: center; justify-content: space-between;
-    }
-
+    .label-row { display: flex; align-items: center; justify-content: space-between; }
     .config-label { font-size: 0.82rem; color: rgba(255,255,255,0.5); font-weight: 500; }
-
     .snapshot-toggle {
         display: flex; align-items: center; gap: 0.3rem;
-        font-size: 0.75rem; color: rgba(255,255,255,0.35);
-        cursor: pointer; font-weight: 400;
+        font-size: 0.75rem; color: rgba(255,255,255,0.35); cursor: pointer;
     }
     .snapshot-toggle input { accent-color: #00c896; cursor: pointer; }
-
     .config-input, .config-select {
         width: 100%; padding: 0.75rem 1rem;
-        background: rgba(0,0,0,0.45);
-        border: 1px solid rgba(255,255,255,0.09);
-        border-radius: 10px; color: #fff;
-        font-size: 0.95rem; box-sizing: border-box; transition: all 0.2s;
+        background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.09);
+        border-radius: 10px; color: #fff; font-size: 0.95rem;
+        box-sizing: border-box; transition: all 0.2s;
     }
     .config-input:focus, .config-select:focus {
-        border-color: #00c896;
-        box-shadow: 0 0 0 3px rgba(0,200,150,0.12); outline: none;
+        border-color: #00c896; box-shadow: 0 0 0 3px rgba(0,200,150,0.12); outline: none;
     }
     .config-select option { background: #1a2332; }
-
     .versions-loading {
         display: flex; align-items: center; gap: 0.5rem;
-        padding: 0.75rem 1rem;
-        background: rgba(0,0,0,0.3); border-radius: 10px;
-        color: rgba(255,255,255,0.4); font-size: 0.875rem;
+        padding: 0.75rem 1rem; background: rgba(0,0,0,0.3);
+        border-radius: 10px; color: rgba(255,255,255,0.4); font-size: 0.875rem;
     }
-
     .btn-cancel {
         background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09);
         color: rgba(255,255,255,0.55); border-radius: 9px;
@@ -702,21 +991,18 @@
         cursor: pointer; transition: all 0.15s;
     }
     .btn-cancel:hover { background: rgba(255,255,255,0.08); }
-
     .btn-confirm {
         display: flex; align-items: center; gap: 0.35rem;
         background: linear-gradient(135deg, #00c896, #00a8ff);
-        border: none; border-radius: 9px;
-        color: #fff; font-size: 0.875rem; font-weight: 700;
+        border: none; border-radius: 9px; color: #fff;
+        font-size: 0.875rem; font-weight: 700;
         padding: 0.55rem 1.25rem; cursor: pointer; transition: all 0.15s;
     }
     .btn-confirm:hover:not(:disabled) { box-shadow: 0 4px 16px rgba(0,200,150,0.35); }
     .btn-confirm:disabled { opacity: 0.35; cursor: not-allowed; }
     .btn-confirm .material-icons { font-size: 16px; }
 
-    /* ═══════════════════════════
-       PLACEHOLDER
-    ═══════════════════════════ */
+    /* Placeholder */
     .page-placeholder {
         display: flex; flex-direction: column; align-items: center;
         justify-content: center; height: 60vh; gap: 1rem;
@@ -726,9 +1012,7 @@
     .page-placeholder h2 { margin: 0; font-size: 1.2rem; color: rgba(255,255,255,0.22); }
     .page-placeholder p { margin: 0; font-size: 0.85rem; }
 
-    /* ═══════════════════════════
-       LOGIN
-    ═══════════════════════════ */
+    /* Login */
     .login-container {
         min-height: 100vh; width: 100%; display: flex; align-items: center; justify-content: center;
         background:
@@ -737,16 +1021,11 @@
                 linear-gradient(135deg, #0a0a0f 0%, #111827 50%, #0a0a0f 100%);
     }
     .card-wrapper { width: 100%; max-width: 360px; padding: 1rem; }
-
     :global(.glass-card) {
-        background: rgba(17,24,39,0.7) !important;
-        backdrop-filter: blur(20px) !important;
-        border: 1px solid rgba(255,255,255,0.08) !important;
-        border-radius: 20px !important;
-        box-shadow: 0 25px 50px rgba(0,0,0,0.5) !important;
-        overflow: hidden;
+        background: rgba(17,24,39,0.7) !important; backdrop-filter: blur(20px) !important;
+        border: 1px solid rgba(255,255,255,0.08) !important; border-radius: 20px !important;
+        box-shadow: 0 25px 50px rgba(0,0,0,0.5) !important; overflow: hidden;
     }
-
     .login-header {
         display: flex; flex-direction: column; align-items: center;
         gap: 0.75rem; text-align: center; padding: 1rem 0;
@@ -764,7 +1043,6 @@
         -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
     }
     .app-subtitle { font-size: 0.875rem; color: rgba(255,255,255,0.42); max-width: 260px; line-height: 1.5; margin: 0; }
-
     .error-banner {
         display: flex; align-items: center; gap: 0.5rem;
         background: rgba(207,102,121,0.12); border: 1px solid rgba(207,102,121,0.28);
@@ -772,37 +1050,27 @@
         color: #cf6679; font-size: 0.875rem;
     }
     .error-icon { font-size: 18px; flex-shrink: 0; }
-
     :global(.login-actions) { padding: 0 1rem 1.25rem !important; }
-
     :global(.microsoft-btn) {
-        width: 100% !important;
-        background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
+        width: 100% !important; background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
         color: #fff !important; border-radius: 12px !important; padding: 0.8rem !important;
         font-size: 0.95rem !important; font-weight: 600 !important;
         display: flex !important; align-items: center !important; justify-content: center !important;
         gap: 0.75rem !important; box-shadow: 0 4px 16px rgba(37,99,235,0.4) !important;
     }
-    :global(.microsoft-btn:hover:not(:disabled)) {
-        box-shadow: 0 6px 24px rgba(37,99,235,0.55) !important; transform: translateY(-1px);
-    }
+    :global(.microsoft-btn:hover:not(:disabled)) { box-shadow: 0 6px 24px rgba(37,99,235,0.55) !important; }
     :global(.microsoft-btn:disabled) { opacity: 0.7 !important; }
-
     .ms-logo { width: 20px; height: 20px; fill: currentColor; flex-shrink: 0; }
-
     .spinner {
-        width: 18px; height: 18px;
-        border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff;
-        border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0;
+        width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.3);
+        border-top-color: #fff; border-radius: 50%;
+        animation: spin 0.7s linear infinite; flex-shrink: 0;
     }
-
     .spinner-sm {
-        width: 14px; height: 14px;
-        border: 2px solid rgba(255,255,255,0.2); border-top-color: #00c896;
-        border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0;
+        width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2);
+        border-top-color: #00c896; border-radius: 50%;
+        animation: spin 0.7s linear infinite; flex-shrink: 0;
     }
-
     @keyframes spin { to { transform: rotate(360deg); } }
-
     .pixelated { image-rendering: pixelated; image-rendering: crisp-edges; }
 </style>

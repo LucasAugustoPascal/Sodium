@@ -11,6 +11,9 @@
     "store:allow-get",
     "store:allow-set",
     "store:allow-delete",
+    "shell:default",
+    "store:default",
+    "dialog:default",
 
     {
       "identifier": "http:allow-fetch",
