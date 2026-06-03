@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'v*'
 
 jobs:
   release:
@@ -14,42 +14,35 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    permissions:
+      contents: write
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: sodium-launcher/package-lock.json
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
         working-directory: sodium-launcher
         run: npm ci
 
-      - name: Debug sodium-launcher/package.json
-        working-directory: sodium-launcher
-        run: |
-          echo "Current directory:"
-          pwd
-          echo "Available scripts:"
-          npm run
-
       - name: Build Frontend
         working-directory: sodium-launcher
         run: npm run build
 
-      - name: Build Tauri
-        working-directory: sodium-launcher
-        run: npm run tauri build
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Tauri Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: app-${{ matrix.platform }}
-          path: sodium-launcher/src-tauri/target/release/bundle/**
+          projectPath: sodium-launcher
+          tagName: ${{ github.ref_name }}
+          releaseName: Sodium Launcher ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
