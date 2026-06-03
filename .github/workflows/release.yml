@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     branches:
-      - main # Le build se lancera quand vous pousserez sur la branche main
+      - master
 
 jobs:
   release:
