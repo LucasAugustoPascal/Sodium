@@ -1,4 +1,5 @@
 name: Release
+
 on:
   push:
     branches:
@@ -10,29 +11,41 @@ jobs:
       fail-fast: false
       matrix:
         platform: [macos-latest, windows-latest]
+
     runs-on: ${{ matrix.platform }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
+
+      - name: Debug package.json
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Available scripts:"
+          npm run
 
       - name: Build Frontend
         run: npm run build
 
       - name: Build Tauri
-        run: npx @tauri-apps/cli build --no-before-build
+        run: npm run tauri build -- --no-before-build
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.platform }}
-          path: src-tauri/target/release/bundle/
+          path: |
+            src-tauri/target/release/bundle/**
