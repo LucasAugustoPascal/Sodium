@@ -23,9 +23,11 @@ fn get_game_dir() -> Result<std::path::PathBuf, String> {
         let base = dirs::home_dir().ok_or("Home introuvable")?;
         Ok(base.join("Library").join("Application Support").join("sodium"))
     }
-    #[cfg(target_os = "windows")]
+   #[cfg(target_os = "windows")]
     {
-        let base = dirs::data_dir().ok_or("AppData\\Roaming introuvable")?;
+        let base = std::env::var("APPDATA")
+            .map(std::path::PathBuf::from)
+            .map_err(|_| "Variable APPDATA introuvable".to_string())?;
         Ok(base.join(".sodium"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -727,7 +729,6 @@ async fn install_bundled_mods(app: tauri::AppHandle) -> Result<(), String> {
         let resource_path = app.path()
             .resource_dir()
             .map_err(|e| e.to_string())?
-            .join("resources")
             .join("mods")
             .join(filename);
 
